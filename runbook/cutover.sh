@@ -101,7 +101,12 @@ psql -h 127.0.0.1 -p "$STANDBY_PORT" -U postgres -d postgres -c \
 confirm "Standby healthy on port $STANDBY_PORT. Ready for Phase 4.7 -- move it back to port $PRIMARY_PORT so PostgREST/GoTrue/postgres_exporter/Supavisor can reconnect without individual reconfiguration?"
 
 echo "=== 4.7 Move new primary back to the original port ==="
-echo "This is a brief additional restart. In-flight client connections on $STANDBY_PORT will be dropped -- confirm no critical traffic depends on that port before proceeding."
+echo "This restart must be paused too -- an earlier version of this script restarted"
+echo "Postgres here without pausing PgBouncer first, which reintroduced exactly the"
+echo "hard client errors (FATAL: server conn crashed) this whole procedure exists to"
+echo "avoid. Do not remove this pause."
+PGPASSWORD="$PGB_ADMIN_PW" psql -h 127.0.0.1 -p "$PGBOUNCER_PORT" -U pgbouncer pgbouncer -c "PAUSE;"
+
 sudo systemctl stop postgresql-standby
 sudo -u postgres bash -c "echo \"port = $PRIMARY_PORT\" >> /pgdata-new/data/postgresql.auto.conf"
 sudo systemctl start postgresql-standby
@@ -111,6 +116,7 @@ psql -h 127.0.0.1 -p "$PRIMARY_PORT" -U postgres -d postgres -c "SELECT pg_is_in
 sudo sed -i "s|^\* = host=localhost port=$STANDBY_PORT auth_user=pgbouncer|* = host=localhost port=$PRIMARY_PORT auth_user=pgbouncer|" /etc/pgbouncer/pgbouncer.ini
 PGPASSWORD="$PGB_ADMIN_PW" psql -h 127.0.0.1 -p "$PGBOUNCER_PORT" -U pgbouncer pgbouncer -c "RELOAD;"
 PGPASSWORD="$PGB_ADMIN_PW" psql -h 127.0.0.1 -p "$PGBOUNCER_PORT" -U pgbouncer pgbouncer -c "RECONNECT;"
+PGPASSWORD="$PGB_ADMIN_PW" psql -h 127.0.0.1 -p "$PGBOUNCER_PORT" -U pgbouncer pgbouncer -c "RESUME;"
 
 echo "=== Verify on-box direct consumers recovered (should be immediate) ==="
 curl -s -o /dev/null -w "postgrest=%{http_code}\n" http://localhost:3000/ || true
