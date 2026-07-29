@@ -13,6 +13,13 @@
 #   - raise PgBouncer's query_wait_timeout BEFORE pausing -- the default
 #     120s is a hard ceiling on how long the whole PAUSE-to-RESUME window
 #     may take, not just a nice-to-have target.
+#   - PgBouncer is not the only consumer: PostgREST, GoTrue, and
+#     postgres_exporter all connect directly to the primary's port (bypassing
+#     PgBouncer entirely), and Supavisor (external, shared, not on this box)
+#     does too. All of them are hardcoded to the ORIGINAL port. Phase 4.7
+#     below moves the new primary back to that port specifically so these
+#     self-heal via ordinary client reconnect logic, instead of needing each
+#     one individually reconfigured (impossible for Supavisor from here).
 set -euo pipefail
 
 STANDBY_PORT="${1:?Usage: $0 <standby-port> <pgbouncer-admin-password>}"
@@ -90,4 +97,26 @@ psql -h 127.0.0.1 -p "$STANDBY_PORT" -U postgres -d postgres -c \
   "SELECT timeline_id FROM pg_control_checkpoint();"
 psql -h 127.0.0.1 -p "$STANDBY_PORT" -U postgres -d postgres -c \
   "SELECT application_name, state, replay_lsn FROM pg_stat_replication;"
+
+confirm "Standby healthy on port $STANDBY_PORT. Ready for Phase 4.7 -- move it back to port $PRIMARY_PORT so PostgREST/GoTrue/postgres_exporter/Supavisor can reconnect without individual reconfiguration?"
+
+echo "=== 4.7 Move new primary back to the original port ==="
+echo "This is a brief additional restart. In-flight client connections on $STANDBY_PORT will be dropped -- confirm no critical traffic depends on that port before proceeding."
+sudo systemctl stop postgresql-standby
+sudo -u postgres bash -c "echo \"port = $PRIMARY_PORT\" >> /pgdata-new/data/postgresql.auto.conf"
+sudo systemctl start postgresql-standby
+sleep 3
+psql -h 127.0.0.1 -p "$PRIMARY_PORT" -U postgres -d postgres -c "SELECT pg_is_in_recovery();"
+
+sudo sed -i "s|^\* = host=localhost port=$STANDBY_PORT auth_user=pgbouncer|* = host=localhost port=$PRIMARY_PORT auth_user=pgbouncer|" /etc/pgbouncer/pgbouncer.ini
+PGPASSWORD="$PGB_ADMIN_PW" psql -h 127.0.0.1 -p "$PGBOUNCER_PORT" -U pgbouncer pgbouncer -c "RELOAD;"
+PGPASSWORD="$PGB_ADMIN_PW" psql -h 127.0.0.1 -p "$PGBOUNCER_PORT" -U pgbouncer pgbouncer -c "RECONNECT;"
+
+echo "=== Verify on-box direct consumers recovered (should be immediate) ==="
+curl -s -o /dev/null -w "postgrest=%{http_code}\n" http://localhost:3000/ || true
+curl -s -o /dev/null -w "exporter=%{http_code}\n" http://localhost:9187/metrics || true
+echo "Note: Supavisor (external) may take substantially longer to recover than on-box"
+echo "consumers -- observed in rehearsal to trip its own auth-failure circuit breaker"
+echo "during the port-mismatch window, which then needs its own cooldown independent"
+echo "of backend health. This is expected; do not attempt to work around it from here."
 echo "Done. Verify application error rates / pgbench error count separately."
